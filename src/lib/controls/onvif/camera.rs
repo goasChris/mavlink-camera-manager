@@ -40,8 +40,20 @@ pub struct Auth {
 
 #[derive(Debug, Clone)]
 pub struct OnvifStreamInformation {
+    pub profile_token: String,
     pub stream_uri: url::Url,
     pub format: Format,
+}
+
+impl OnvifStreamInformation {
+    pub fn source_string(&self, device_uuid: uuid::Uuid) -> String {
+        let mut source = url::Url::parse(&format!("onvif://{device_uuid}")).unwrap();
+        source
+            .path_segments_mut()
+            .unwrap()
+            .push(&self.profile_token);
+        source.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -54,6 +66,56 @@ pub struct OnvifDeviceInformation {
 }
 
 impl OnvifCamera {
+    #[cfg(test)]
+    pub(super) fn for_test(device_uuid: uuid::Uuid, ip: &str) -> Self {
+        let url = url::Url::parse(&format!("http://{ip}/onvif/device_service")).unwrap();
+        Self {
+            last_update: std::time::Instant::now(),
+            context: Arc::new(RwLock::new(OnvifCameraContext {
+                device: OnvifDevice {
+                    uuid: device_uuid,
+                    ip: ip.parse().unwrap(),
+                    types: vec![],
+                    hardware: None,
+                    name: None,
+                    urls: vec![url.clone()],
+                },
+                device_information: OnvifDeviceInformation {
+                    manufacturer: "Test".into(),
+                    model: "Test".into(),
+                    firmware_version: "1".into(),
+                    serial_number: "123".into(),
+                    hardware_id: "Test".into(),
+                },
+                streams_information: Some(
+                    ["Profile1", "Profile2"]
+                        .into_iter()
+                        .map(|profile| OnvifStreamInformation {
+                            profile_token: profile.into(),
+                            stream_uri: url::Url::parse(&format!(
+                                "rtsp://user:password@{ip}:554/{profile}"
+                            ))
+                            .unwrap(),
+                            format: Format {
+                                encode: crate::video::types::VideoEncodeType::H264,
+                                sizes: vec![],
+                            },
+                        })
+                        .collect(),
+                ),
+                credentials: None,
+                devicemgmt: soap::client::ClientBuilder::new(&url).build(),
+                event: None,
+                deviceio: None,
+                media: None,
+                media2: None,
+                imaging: None,
+                ptz: None,
+                analytics: None,
+            })),
+        }
+    }
+
     #[instrument(level = "trace", skip(auth))]
     pub async fn try_new(device: &OnvifDevice, auth: &Auth) -> Result<Self> {
         let creds = &auth.credentials;
@@ -273,7 +335,11 @@ impl OnvifCamera {
 
             let format = Format { encode, sizes };
 
-            streams_information.push(OnvifStreamInformation { stream_uri, format });
+            streams_information.push(OnvifStreamInformation {
+                profile_token: profile.token.0.clone(),
+                stream_uri,
+                format,
+            });
         }
 
         Ok(streams_information)

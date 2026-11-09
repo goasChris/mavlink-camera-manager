@@ -41,11 +41,17 @@ pub async fn cameras_available() -> Vec<VideoSourceType> {
 pub async fn get_video_source(source_string: &str) -> Result<VideoSourceType, std::io::Error> {
     let cameras = cameras_available().await;
 
-    if let Some(camera) = cameras
-        .iter()
-        .find(|source| source.inner().source_string() == source_string)
-    {
+    if let Some(camera) = cameras.iter().find(|source| {
+        source.inner().source_string() == source_string
+            || matches!(source, VideoSourceType::Onvif(onvif) if onvif.matches_uri(source_string))
+    }) {
         return Ok(camera.clone());
+    }
+
+    if !crate::cli::manager::is_onvif_disabled()
+        && let Some(source) = VideoSourceOnvif::explicit_rtsp(source_string)
+    {
+        return Ok(VideoSourceType::Onvif(source));
     }
 
     let sources_available: Vec<String> = cameras

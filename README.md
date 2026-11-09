@@ -114,6 +114,25 @@ For more information about the CLI arguments, `mavlink-camera-manager --help` wi
 - For developers, the Swagger UI with documentation for the entire REST API can be found at http://localhost:6020/docs
   ![picture 2](images/swagger_ui.png)
 
+### ONVIF sources and changing networks
+
+Discovered ONVIF sources use `onvif://<device-uuid>/<profile-token>` identifiers.
+Use the source returned by `/v4l` when creating a stream via `/streams`. The UUID
+and profile token remain in the saved configuration; the current RTSP URI
+(including registered credentials) is resolved from discovery whenever the
+pipeline restarts. Cameras must be discoverable on the new network.
+
+Legacy RTSP sources are still accepted and are upgraded to stable identifiers
+when their URI matches a discovered stream. Run once while the original address
+is reachable to save this association before moving the camera.
+
+Alternatively, `/streams` accepts an explicit source such as
+`rtsp://camera.example.com:554/media/1/1/Profile1` without requiring a discovered
+device. The hostname is preserved and resolved by the RTSP client on reconnect.
+For these sources, include any required credentials in the RTSP URL; discovery
+credentials are only applied to discovered sources. `--disable-onvif` continues
+to disable both kinds of ONVIF source.
+
 ## Quick test guide
 
 The short clip below shows how an H264 UDP stream can be configured using the management interface, and how it can be accessed as a WebRTC stream.

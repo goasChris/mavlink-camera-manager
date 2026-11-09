@@ -28,7 +28,7 @@ use crate::{
     mavlink::mavlink_camera::MavlinkCamera,
     video::{
         types::{FrameInterval, VideoEncodeType, VideoSourceType},
-        video_source::{VideoSource, cameras_available},
+        video_source::cameras_available,
     },
     video_stream::types::VideoAndStreamInformation,
 };
@@ -68,6 +68,7 @@ pub struct StreamState {
 fn normalize_pipeline_source_string(source_string: &str) -> String {
     // To be DHCP-friendly, we ignore the address for IP-based sources.
     match source_string.parse::<url::Url>() {
+        Ok(url) if url.scheme() == "onvif" => url.to_string(),
         Ok(mut url) => {
             let _ = url.set_host(None);
             let _ = url.set_port(None);
@@ -117,9 +118,9 @@ fn default_video_capture_configuration(encode: VideoEncodeType) -> VideoCaptureC
 /// when probing failed.
 #[instrument(level = "debug", skip_all)]
 pub(crate) async fn refresh_source_configuration(
-    video_and_stream_information: &VideoAndStreamInformation,
+    video_and_stream_information: &mut VideoAndStreamInformation,
 ) -> Result<Option<CaptureConfiguration>> {
-    match &video_and_stream_information.video_source {
+    match &mut video_and_stream_information.video_source {
         VideoSourceType::Redirect(_) => {
             let url = video_and_stream_information
                 .stream_information
@@ -133,10 +134,13 @@ pub(crate) async fn refresh_source_configuration(
         }
 
         VideoSourceType::Onvif(source) => {
-            let url = url::Url::parse(source.source_string())
-                .context("Failed to parse ONVIF source URL")?;
+            *source = source.resolve().await?;
+            let url = source
+                .stream_uri
+                .as_ref()
+                .context("Failed to resolve ONVIF source URL")?;
 
-            get_capture_configuration_from_stream_uri(&url)
+            get_capture_configuration_from_stream_uri(url)
                 .await
                 .map(Some)
         }
@@ -148,6 +152,13 @@ pub(crate) async fn refresh_source_configuration(
 impl Stream {
     #[instrument(level = "debug", skip_all)]
     pub async fn try_new(video_and_stream_information: &VideoAndStreamInformation) -> Result<Self> {
+        let mut resolved_information = video_and_stream_information.clone();
+        if let VideoSourceType::Onvif(source) = &mut resolved_information.video_source
+            && let Ok(resolved) = source.resolve().await
+        {
+            *source = resolved;
+        }
+        let video_and_stream_information = &resolved_information;
         let pipeline_id = Arc::new(generate_pipeline_id(video_and_stream_information));
 
         // Replace Redirect with Video
@@ -333,19 +344,37 @@ impl Stream {
                         }
                     }
 
-                    let video_and_stream_information_cloned =
+                    let mut video_and_stream_information_cloned =
                         video_and_stream_information.read().await.clone();
+                    let previous_source = video_and_stream_information_cloned
+                        .video_source
+                        .inner()
+                        .source_string()
+                        .to_string();
 
                     // Re-probe configuration for sources that support it (Redirect, Onvif)
-                    match refresh_source_configuration(&video_and_stream_information_cloned).await {
+                    let refreshed =
+                        refresh_source_configuration(&mut video_and_stream_information_cloned)
+                            .await;
+                    match refreshed {
                         Ok(Some(capture_configuration)) => {
                             *error_status.write().await = Ok(());
 
-                            video_and_stream_information
-                                .write()
-                                .await
-                                .stream_information
-                                .configuration = capture_configuration;
+                            {
+                                let mut information = video_and_stream_information.write().await;
+                                information.stream_information.configuration =
+                                    capture_configuration;
+                                information.video_source =
+                                    video_and_stream_information_cloned.video_source.clone();
+                            }
+                            if previous_source
+                                != video_and_stream_information_cloned
+                                    .video_source
+                                    .inner()
+                                    .source_string()
+                            {
+                                manager::save_streams().await;
+                            }
                         }
                         Ok(None) => {
                             // No probing needed (Gst) or handled separately (Local)
@@ -1409,6 +1438,7 @@ mod tests {
             video_source: VideoSourceType::Onvif(VideoSourceOnvif {
                 name: "Test ONVIF Camera".into(),
                 source: VideoSourceOnvifType::Onvif(source_url.to_string()),
+                stream_uri: None,
                 device_information: OnvifDeviceInformation {
                     manufacturer: "Test".into(),
                     model: "Test".into(),
@@ -1420,14 +1450,57 @@ mod tests {
         }
     }
 
+    #[test]
+    fn onvif_pipeline_ids_distinguish_device_uuids() {
+        let first = onvif_stream(
+            "Camera",
+            "onvif://bc071801-c50f-8301-ac36-bc071801c50f/Profile1",
+        );
+        let second = onvif_stream(
+            "Camera",
+            "onvif://bc071801-c50f-8301-ac36-bc071801c510/Profile1",
+        );
+        assert_ne!(generate_pipeline_id(&first), generate_pipeline_id(&second));
+    }
+
+    #[test]
+    fn onvif_pipeline_uses_current_rtsp_uri_not_device_identity() {
+        ::gst::init().unwrap();
+        let mut stream = onvif_stream(
+            "Camera",
+            "onvif://bc071801-c50f-8301-ac36-bc071801c50f/Profile1",
+        );
+        let location = "rtsp://user:password@10.0.0.25/Profile1";
+        let VideoSourceType::Onvif(source) = &mut stream.video_source else {
+            unreachable!();
+        };
+        source.stream_uri = Some(Url::parse(location).unwrap());
+        let pipeline = pipeline::onvif_pipeline::OnvifPipeline::try_new(
+            &Arc::new(generate_pipeline_id(&stream)),
+            &stream,
+        )
+        .unwrap();
+        let rtsp_source = pipeline
+            .iterate_elements()
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|element| {
+                element
+                    .factory()
+                    .is_some_and(|factory| factory.name() == "rtspsrc")
+            })
+            .unwrap();
+        assert_eq!(rtsp_source.property::<String>("location"), location);
+    }
+
     #[tokio::test]
     async fn refresh_source_configuration_redirect_detects_h264() {
         let port = allocate_udp_port();
         let sender = spawn_h264_udp_sender(port);
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let stream = redirect_stream("test-redirect", &format!("udp://127.0.0.1:{port}"));
-        let result = refresh_source_configuration(&stream).await;
+        let mut stream = redirect_stream("test-redirect", &format!("udp://127.0.0.1:{port}"));
+        let result = refresh_source_configuration(&mut stream).await;
         sender.set_state(::gst::State::Null).unwrap();
 
         let config = result
@@ -1446,8 +1519,8 @@ mod tests {
         let sender = spawn_h264_udp_sender(port);
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let stream = redirect_stream("test-redirect", &format!("udp://127.0.0.1:{port}"));
-        let result = refresh_source_configuration(&stream).await;
+        let mut stream = redirect_stream("test-redirect", &format!("udp://127.0.0.1:{port}"));
+        let result = refresh_source_configuration(&mut stream).await;
         sender.set_state(::gst::State::Null).unwrap();
 
         let config = result.unwrap().unwrap();
@@ -1459,7 +1532,7 @@ mod tests {
         let sender = spawn_h265_udp_sender(port);
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let result = refresh_source_configuration(&stream).await;
+        let result = refresh_source_configuration(&mut stream).await;
         sender.set_state(::gst::State::Null).unwrap();
 
         let config = result.unwrap().unwrap();
@@ -1475,8 +1548,8 @@ mod tests {
         let sender = spawn_h264_udp_sender(port);
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let stream = onvif_stream("test-onvif", &format!("udp://127.0.0.1:{port}"));
-        let result = refresh_source_configuration(&stream).await;
+        let mut stream = onvif_stream("test-onvif", &format!("udp://127.0.0.1:{port}"));
+        let result = refresh_source_configuration(&mut stream).await;
         sender.set_state(::gst::State::Null).unwrap();
 
         let config = result
@@ -1495,8 +1568,8 @@ mod tests {
         let sender = spawn_h264_udp_sender(port);
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let stream = onvif_stream("test-onvif", &format!("udp://127.0.0.1:{port}"));
-        let result = refresh_source_configuration(&stream).await;
+        let mut stream = onvif_stream("test-onvif", &format!("udp://127.0.0.1:{port}"));
+        let result = refresh_source_configuration(&mut stream).await;
         sender.set_state(::gst::State::Null).unwrap();
 
         let config = result.unwrap().unwrap();
@@ -1508,7 +1581,7 @@ mod tests {
         let sender = spawn_h265_udp_sender(port);
         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        let result = refresh_source_configuration(&stream).await;
+        let result = refresh_source_configuration(&mut stream).await;
         sender.set_state(::gst::State::Null).unwrap();
 
         let config = result.unwrap().unwrap();
@@ -1521,7 +1594,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn refresh_source_configuration_returns_none_for_local() {
-        let stream = VideoAndStreamInformation {
+        let mut stream = VideoAndStreamInformation {
             name: "test-local".into(),
             stream_information: test_stream_information(),
             video_source: VideoSourceType::Local(VideoSourceLocal {
@@ -1531,7 +1604,7 @@ mod tests {
             }),
         };
 
-        let result = refresh_source_configuration(&stream).await;
+        let result = refresh_source_configuration(&mut stream).await;
         assert!(result.unwrap().is_none());
     }
 

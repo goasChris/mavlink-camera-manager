@@ -213,6 +213,7 @@ pub async fn info() -> Result<CreatedJson<Info>> {
 /// Provides list of all video sources, with controls and formats
 pub async fn v4l() -> Result<Json<Vec<ApiVideoSource>>> {
     let cameras = video_source::cameras_available().await;
+    stream_manager::migrate_onvif_blocked_sources(&cameras);
     let blocked_sources = stream_manager::blocked_sources();
 
     use futures::stream::{self, StreamExt};

@@ -6,10 +6,7 @@ use tracing::*;
 
 use crate::{
     stream::types::CaptureConfiguration,
-    video::{
-        types::{VideoEncodeType, VideoSourceType},
-        video_source_onvif::VideoSourceOnvifType,
-    },
+    video::types::{VideoEncodeType, VideoSourceType},
     video_stream::types::VideoAndStreamInformation,
 };
 
@@ -50,10 +47,11 @@ impl OnvifPipeline {
             }
         };
 
-        let location = {
-            let VideoSourceOnvifType::Onvif(url) = &video_source.source;
-            url.to_string()
-        };
+        let location = video_source
+            .stream_uri
+            .as_ref()
+            .ok_or_else(|| anyhow!("ONVIF stream URI has not been resolved"))?
+            .to_string();
 
         let encode = match &video_and_stream_information
             .stream_information

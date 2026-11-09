@@ -40,6 +40,23 @@ pub struct ManagerContext {
     url_credentials: HashMap<Ipv4Addr, Credentials>,
 }
 
+impl ManagerContext {
+    async fn stream_information(&self, source: &str) -> Result<OnvifStreamInformation> {
+        let camera = self.cameras.get(source).context("Camera not found")?;
+        let camera_context = camera.context.read().await;
+        let streams_information = camera_context
+            .streams_information
+            .as_ref()
+            .context("Failed getting stream information")?;
+
+        streams_information
+            .iter()
+            .find(|stream| stream.source_string(camera_context.device.uuid) == source)
+            .cloned()
+            .context("Camera not found")
+    }
+}
+
 type StreamURI = String;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -527,11 +544,8 @@ impl Manager {
                     stream_information.stream_uri
                 );
 
-                // Create an unauthenticated version of the stream URI for the map key
-                let mut unauthenticated_stream_uri = stream_information.stream_uri.clone();
-                unauthenticated_stream_uri.set_password(None).unwrap();
-                unauthenticated_stream_uri.set_username("").unwrap();
-                let unauth_uri_string = unauthenticated_stream_uri.to_string();
+                // Profile tokens distinguish streams without depending on the device's address.
+                let unauth_uri_string = stream_information.source_string(device_uuid);
 
                 // Insert or update the camera in the map
                 let is_new_entry = !context.cameras.contains_key(&unauth_uri_string);
@@ -561,6 +575,11 @@ impl Manager {
 
     #[instrument(level = "debug")]
     pub async fn get_formats(stream_uri: &StreamURI) -> Result<Vec<Format>> {
+        Ok(vec![Self::get_stream_information(stream_uri).await?.format])
+    }
+
+    #[instrument(level = "debug")]
+    pub async fn get_stream_information(source: &str) -> Result<OnvifStreamInformation> {
         if crate::cli::manager::is_onvif_disabled() {
             return Err(anyhow!("ONVIF is disabled by --disable-onvif"));
         }
@@ -568,27 +587,7 @@ impl Manager {
         let mcontext = MANAGER.read().await.mcontext.clone();
         let mcontext = mcontext.read().await;
 
-        let camera = mcontext
-            .cameras
-            .get(stream_uri)
-            .context("Camera not found")?;
-
-        let Some(streams_information) = &camera.context.read().await.streams_information.clone()
-        else {
-            return Err(anyhow!("Failed getting stream information"));
-        };
-
-        let stream_information = streams_information
-            .iter()
-            .find(|stream_information| {
-                let mut unauthenticated_stream_uri = stream_information.stream_uri.clone();
-                let _ = unauthenticated_stream_uri.set_password(None);
-                let _ = unauthenticated_stream_uri.set_username("");
-                unauthenticated_stream_uri.to_string() == *stream_uri
-            })
-            .context("Camera not found")?;
-
-        Ok(vec![stream_information.format.clone()])
+        mcontext.stream_information(source).await
     }
 
     #[instrument(level = "debug")]
@@ -602,7 +601,20 @@ impl Manager {
 
         let mut streams_available = vec![];
         for (stream_uri, camera) in mcontext.cameras.iter() {
-            let device_information = camera.context.read().await.device_information.clone();
+            let camera_context = camera.context.read().await;
+            let device_information = camera_context.device_information.clone();
+            let Some(stream_information) =
+                camera_context
+                    .streams_information
+                    .as_ref()
+                    .and_then(|streams| {
+                        streams.iter().find(|stream| {
+                            stream.source_string(camera_context.device.uuid) == *stream_uri
+                        })
+                    })
+            else {
+                continue;
+            };
 
             let name = format!(
                 "{model} - {manufacturer} ({hardware_id})",
@@ -617,6 +629,7 @@ impl Manager {
                 name,
                 source,
                 device_information,
+                stream_uri: Some(stream_information.stream_uri.clone()),
             });
 
             streams_available.push(stream);
@@ -680,4 +693,66 @@ fn device_address_to_uuid(device_address: &str) -> Result<uuid::Uuid> {
         .context("Failed to parse device address into a UUID")?
         .parse()
         .map_err(anyhow::Error::msg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn onvif_identity_survives_address_changes_and_distinguishes_profiles() {
+        let device_uuid = uuid::Uuid::new_v4();
+        let mut context = ManagerContext {
+            cameras: HashMap::new(),
+            discovered_devices: HashMap::new(),
+            credentials: HashMap::new(),
+            url_credentials: HashMap::new(),
+        };
+        let camera = OnvifCamera::for_test(device_uuid, "192.168.1.10");
+        let streams = camera
+            .context
+            .read()
+            .await
+            .streams_information
+            .clone()
+            .unwrap();
+        let sources: Vec<_> = streams
+            .iter()
+            .map(|stream| stream.source_string(device_uuid))
+            .collect();
+        assert_ne!(sources[0], sources[1]);
+        for source in &sources {
+            context.cameras.insert(source.clone(), camera.clone());
+        }
+        assert_eq!(
+            context
+                .stream_information(&sources[0])
+                .await
+                .unwrap()
+                .stream_uri
+                .host_str(),
+            Some("192.168.1.10")
+        );
+
+        let moved = OnvifCamera::for_test(device_uuid, "10.0.0.25");
+        for source in &sources {
+            context.cameras.insert(source.clone(), moved.clone());
+        }
+        assert_eq!(context.cameras.len(), 2);
+        let resolved = context.stream_information(&sources[0]).await.unwrap();
+        assert_eq!(resolved.stream_uri.host_str(), Some("10.0.0.25"));
+        assert_eq!(resolved.stream_uri.username(), "user");
+        assert_eq!(resolved.stream_uri.password(), Some("password"));
+        assert_eq!(resolved.profile_token, "Profile1");
+        assert_eq!(
+            context
+                .stream_information(&sources[1])
+                .await
+                .unwrap()
+                .profile_token,
+            "Profile2"
+        );
+        let other_device = streams[0].source_string(uuid::Uuid::new_v4());
+        assert!(context.stream_information(&other_device).await.is_err());
+    }
 }

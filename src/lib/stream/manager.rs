@@ -19,7 +19,7 @@ use crate::{
     },
     video::{
         types::{Format, VideoSourceType},
-        video_source::{self, VideoSourceFormats},
+        video_source::{self, VideoSource, VideoSourceFormats},
     },
     video_stream::types::VideoAndStreamInformation,
 };
@@ -119,6 +119,7 @@ pub async fn start_default() -> Result<()> {
 
     // Update all local video sources to make sure that they are available
     let mut candidates = video_source::cameras_available().await;
+    migrate_onvif_blocked_sources(&candidates);
     update_devices(&mut streams, &mut candidates, true).await;
 
     if crate::cli::manager::is_onvif_disabled() {
@@ -216,6 +217,10 @@ pub async fn update_devices(
 #[instrument(level = "debug")]
 pub async fn streams() -> Result<Vec<StreamStatus>> {
     Manager::streams_information().await
+}
+
+pub(crate) async fn save_streams() {
+    MANAGER.read().await.update_settings().await;
 }
 
 #[instrument(level = "debug")]
@@ -482,6 +487,9 @@ pub async fn get_jpeg_thumbnail_from_source(
 pub async fn add_stream_and_start(
     video_and_stream_information: VideoAndStreamInformation,
 ) -> Result<()> {
+    migrate_onvif_blocked_sources(std::slice::from_ref(
+        &video_and_stream_information.video_source,
+    ));
     // Check if source is blocked
     let source_string = video_and_stream_information
         .video_source
@@ -558,6 +566,11 @@ pub async fn remove_stream_by_name(stream_name: &str) -> Result<()> {
 
 #[instrument(level = "debug")]
 pub async fn block_source(source_string: &str) -> Result<()> {
+    let resolved = video_source::get_video_source(source_string).await.ok();
+    let source_string = resolved
+        .as_ref()
+        .map(|source| source.inner().source_string())
+        .unwrap_or(source_string);
     // Add to blocked list
     settings::manager::add_blocked_source(source_string);
 
@@ -587,6 +600,11 @@ pub async fn block_source(source_string: &str) -> Result<()> {
 
 #[instrument(level = "debug")]
 pub async fn unblock_source(source_string: &str) -> Result<()> {
+    let resolved = video_source::get_video_source(source_string).await.ok();
+    let source_string = resolved
+        .as_ref()
+        .map(|source| source.inner().source_string())
+        .unwrap_or(source_string);
     settings::manager::remove_blocked_source(source_string);
     Ok(())
 }
@@ -599,6 +617,30 @@ pub async fn clear_blocked_sources() {
 #[instrument(level = "debug")]
 pub fn blocked_sources() -> Vec<String> {
     settings::manager::blocked_sources()
+}
+
+pub(crate) fn migrate_onvif_blocked_sources(cameras: &[VideoSourceType]) {
+    let mut blocked = blocked_sources();
+    let mut changed = false;
+    for source in &mut blocked {
+        if let Some(camera) = cameras.iter().find_map(|camera| match camera {
+            VideoSourceType::Onvif(camera)
+                if camera.source_string().starts_with("onvif://") && camera.matches_uri(source) =>
+            {
+                Some(camera)
+            }
+            _ => None,
+        }) {
+            let stable_source = camera.source_string();
+            if source.as_str() != stable_source {
+                *source = stable_source.to_string();
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        settings::manager::set_blocked_sources(&blocked);
+    }
 }
 
 #[instrument(level = "debug")]
